@@ -74,7 +74,28 @@ def get_data(symbol, timeframe, limit=100):
     except:
         return None
 
-def analyze_coin(symbol):
+def check_btc_trend():
+    """Bitcoin trendini analiz eder. (Market Genel Sağlığı)"""
+    try:
+        # RSI ve Trend Yönü Kontrolü
+        btc_df = get_data('BTC/USDT', '1h', limit=50)
+        if btc_df is None: return None
+        
+        btc_rsi = ta.rsi(btc_df['close'], length=14).iloc[-1]
+        btc_close = btc_df['close'].iloc[-1]
+        btc_open_24h = btc_df['open'].iloc[-24] # Yaklaşık 24 saat önce
+        
+        btc_change_24h = ((btc_close - btc_open_24h) / btc_open_24h) * 100
+        
+        return {
+            'rsi': btc_rsi,
+            'change_24h': btc_change_24h,
+            'price': btc_close
+        }
+    except:
+        return None
+
+def analyze_coin(symbol, btc_market_data):
     global last_signal_times
     
     try:
@@ -111,19 +132,22 @@ def analyze_coin(symbol):
         adx_15m = ta.adx(df_15m['high'], df_15m['low'], df_15m['close'], length=14)
         adx_value = adx_15m['ADX_14'].iloc[-1]
 
-        # ATR
+        # ATR (Sadece Bilgi Amaçlı, Stop için Swing Kullanacağız)
         atr_15m = ta.atr(df_15m['high'], df_15m['low'], df_15m['close'], length=14).iloc[-1]
         
         # --- DÜZELTİLMİŞ HACİM KONTROLÜ (TRADER MANTIĞI) ---
-        # Pullback (geri çekilme) stratejilerinde, fiyatın tersine gittiği mumda hacmin 
-        # aşırı yüksek OLMAMASI istenir. Aşırı yüksek hacim, trendin döndüğünü (çöküş/pump) gösterir.
-        vol_ma = df_15m['volume'].rolling(20).mean().iloc[-1]
-        last_closed_vol = df_15m['volume'].iloc[-1] 
+        # Önceki mumda hacim sakin olmalı (Düşen Bıçak Değil),
+        # Şimdiki mumda (veya bir öncekinde) hacim artmaya başlamalı.
+        vol_ma_20 = df_15m['volume'].rolling(20).mean().iloc[-1]
+        vol_prev = df_15m['volume'].iloc[-2]  # Bir önceki kapanmış mum
+        vol_curr = df_15m['volume'].iloc[-1]  # Şu anki mum
         
-        # Hacim Filtresi: Son mumun hacmi, 20 mumluk ortalamanın 1.5 katından küçük olmalı.
-        # Bu sayede 'fiyat çakılırken' veya 'fiyat fırlarken' trene atlamıyoruz.
-        is_vol_calm = last_closed_vol < (vol_ma * 1.5)
-
+        # 1. Önceki mum panik satışı olmamalı (Ortalamanın 2 katından az)
+        is_prev_vol_safe = vol_prev < (vol_ma_20 * 2.0)
+        
+        # 2. Hacim canlanıyor olmalı (Opsiyonel ama iyi bir teyit)
+        # Mevcut hacim ortalamanın yarısını geçtiyse yeterli (Henüz kapanmadı çünkü)
+        
         # Open Interest & Değişim Analizi
         oi_change_pct = 0
         oi_direction = "➖"
@@ -132,81 +156,132 @@ def analyze_coin(symbol):
             oi_data = exchange.fetch_open_interest(symbol)
             open_interest = float(oi_data.get('openInterestValue', 0))
             
-            # OI Geçmişi (Değişim için)
+            # FALLBACK
+            if open_interest == 0:
+                oi_amount = float(oi_data.get('openInterestAmount', 0))
+                if oi_amount > 0:
+                    open_interest = oi_amount * current_price
+
+            # OI Geçmişi
             try:
-                # 15 dakikalık mumlarla son 2 veriyi alıp değişime bakalım
                 oi_hist = exchange.fetch_open_interest_history(symbol, timeframe='15m', limit=2)
                 if oi_hist and len(oi_hist) >= 2:
                     prev_oi = float(oi_hist[0].get('openInterestValue', 0))
                     curr_oi = float(oi_hist[1].get('openInterestValue', 0))
+                    
+                    if prev_oi == 0: prev_oi = float(oi_hist[0].get('openInterestAmount', 0)) * current_price
+                    if curr_oi == 0: curr_oi = float(oi_hist[1].get('openInterestAmount', 0)) * current_price
+
                     if prev_oi > 0:
                         oi_change_pct = ((curr_oi - prev_oi) / prev_oi) * 100
                         oi_direction = "⬆️" if oi_change_pct > 0 else "⬇️"
             except:
-                pass # History desteklenmiyorsa geç
+                pass 
         except:
             open_interest = 0
 
         signal_type = None
         emoji = ""
         
-        # --- GÜNCELLENMİŞ STRATEJİ PARAMETRELERİ (V5 - SELECTIVE) ---
-        # Güçlü trend tanımını zorlaştırdık (ADX > 30)
+        # --- MASTER PLAN: GÜNCELLENMİŞ STRATEJİ (V7 - PRO TRADER) ---
         
-        is_strong_trend = adx_value > 30
-        
-        # LONG LİMİTLERİ (Daha sıkı)
-        rsi_long_threshold = 45 if is_strong_trend else 30
-        
-        # SHORT LİMİTLERİ (Kullanıcı İsteği: 70)
-        # Trend çok güçlüyse 65'ten dönebilir, normalse 70'i (aşırı şişme) bekleriz.
-        rsi_short_threshold = 65 if is_strong_trend else 70
+        # Trend Gücü Filtresi (25 Altı Chop Market)
+        if adx_value < 25: 
+            return # YATAY PİYASADA İŞLEM YOK.
 
-        # --- STRATEJİ MOTORU (V4 - BALANCED SNIPER) ---
+        is_super_trend = adx_value > 40
         
-        # LONG SENARYOSU
-        # 1. Ana Trend: Fiyat EMA 200 (4H) üstünde OLMALI
-        # 2. Ara Trend: Fiyat EMA 50 (1H) üstünde OLMALI
-        # 3. Tetikleyici: RSI Limit Altında VE MFI Destekliyor VE Hacim Sakin (Çöküş değil)
+        # DİNAMİK RSI LİMİTLERİ (Trend Gücüne Göre Esneme)
+        # "Trend güçlüyse, RSI dibe inmeden alım fırsatı biter."
+        if is_super_trend:
+            rsi_long_limit = 50  # Güçlü trendde 50'den döner
+            rsi_short_limit = 50 # Güçlü düşüşte 50'den döner
+        else:
+            rsi_long_limit = 35  # Normal trendde ucuzluk bekle
+            rsi_short_limit = 65 # Normal trendde pahalılık bekle
+
+        # STOP LOSS: SWING LOW/HIGH MANTIĞI (Robot Avlanmaz)
+        # Son 10 mumun en düşüğünü bul
+        swing_low = df_15m['low'].iloc[-10:].min()
+        swing_high = df_15m['high'].iloc[-10:].max()
+        
+        # BTC KONTROLÜ (MARKET DOMINANCE) - GÜNCELLENDİ (Fırsatçı Mod)
+        # Kullanıcı İsteği: BTC %3 düştüyse kaçma, tam tersine bu bir fırsat olabilir!
+        # "BTC Çakıldıysa altcoinler ezilmiştir, tepki yükselişi yakındır."
+        
+        btc_change = btc_market_data['change_24h']
+        
+        # Eğer BTC çok düştüyse (Örn: -%3), Long girmek için ekstra iştahlı olacağız.
+        # Ama BTC çok sert çakılıyorsa (-%7 gibi) hala dikkatli olmakta fayda var (Bıçak tutulmaz).
+        # Şimdilik sadece "BTC yüzünden Long iptali"ni kaldırıyoruz.
+        
+        # --- LONG SENARYOSU ---
         if current_price > ema_200_4h and current_price > ema_50_1h:
-            if rsi_15m < rsi_long_threshold and mfi_15m < (rsi_long_threshold + 10) and adx_value > 20 and is_vol_calm:
-                signal_type = "LONG"
-                emoji = "🟢 🐂"
-                stop_loss = current_price - (atr_15m * 2) 
-                take_profit = current_price + (atr_15m * 3)
+            
+            # OI KONTROLÜ: Fiyat Düşerken OI Artıyorsa SHORT BASKISI vardır.
+            is_oi_safe_long = True
+            if oi_change_pct > 1.5: # %1.5'tan fazla OI artışı varsa (Short açıyorlar demektir)
+                 is_oi_safe_long = False
+            
+            # SADECE LONG İÇİN ÖZEL İSTİSNA:
+            # BTC %3'ten fazla düştüyse, RSI limitini biraz daha esnetebiliriz (Daha erken girsin)
+            # Çünkü tepki alımı sert olabilir.
+            current_rsi_limit = rsi_long_limit
+            if btc_change < -3.0:
+                current_rsi_limit += 5  # Limit 35 ise 40 yapar, daha kolay aldırır.
+
+            if (rsi_15m < current_rsi_limit and 
+                mfi_15m < (current_rsi_limit + 15) and 
+                is_prev_vol_safe and 
+                is_oi_safe_long):
                 
-        # SHORT SENARYOSU
+                signal_type = "LONG"
+                emoji = "🟢 🚀" 
+                stop_loss = swing_low * 0.995 # Swing Low altı %0.5
+                take_profit = current_price + (atr_15m * 3.5) # Risk/Reward artırıldı
+                
+        # --- SHORT SENARYOSU ---
         elif current_price < ema_200_4h and current_price < ema_50_1h:
-            if rsi_15m > rsi_short_threshold and mfi_15m > (rsi_short_threshold - 10) and adx_value > 20 and is_vol_calm:
+            
+            # OI KONTROLÜ: Fiyat Yükselirken OI Artıyorsa LONG BASKISI vardır.
+            is_oi_safe_short = True
+            if oi_change_pct > 1.5:
+                is_oi_safe_short = False
+
+            if (rsi_15m > rsi_short_limit and 
+                mfi_15m > (rsi_short_limit - 15) and 
+                is_prev_vol_safe and
+                is_oi_safe_short):
+                
                 signal_type = "SHORT"
-                emoji = "🔴 🐻"
-                stop_loss = current_price + (atr_15m * 2)
-                take_profit = current_price - (atr_15m * 3)
+                emoji = "🔴 📉"
+                stop_loss = swing_high * 1.005 # Swing High üstü %0.5
+                take_profit = current_price - (atr_15m * 3.5)
 
         # 4. İLETİŞİM
         if signal_type:
             oi_formatted = f"${open_interest/1_000_000:.2f}M"
-            trend_strength = "GÜÇLÜ 🔥" if is_strong_trend else "NORMAL 😐"
             
-            # Neden girdik açıklaması
             reason = "Bilinmiyor"
             if signal_type == "LONG":
-                reason = f"Fiyat yükseliş trendinde. RSI ({rsi_15m:.1f}) < {rsi_long_threshold} seviyesine inerek alım fırsatı verdi."
+                reason = f"Trend: {adx_value:.0f} (Güçlü). RSI: {rsi_15m:.1f} strateji limitinde. BTC ve OI Baskısı güvenli."
             else:
-                reason = f"Fiyat düşüş trendinde. RSI ({rsi_15m:.1f}) > {rsi_short_threshold} seviyesine çıkarak satış fırsatı verdi."
+                reason = f"Trend: {adx_value:.0f} (Güçlü). RSI: {rsi_15m:.1f} strateji limitinde. Tepe dönüşü yakalandı."
 
             msg = (
-                f"{emoji} **🛡️ SENTINEL: TREND AVCISI 🛡️** {emoji}\n\n"
+                f"{emoji} **🛡️ SENTINEL PRO: SMART TRADER 🛡️** {emoji}\n\n"
                 f"🪙 **Coin:** `{symbol}`\n"
                 f"⚡ **Yön:** {signal_type}\n"
-                f"🌊 **Trend:** {trend_strength} (ADX: {adx_value:.1f})\n"
-                f"💵 **Fiyat:** {current_price}\n"
-                f"🛑 **Stop:** {stop_loss:.4f}\n"
-                f"💰 **TP:** {take_profit:.4f}\n"
-                f"📉 **RSI (15m):** {rsi_15m:.1f} (Limit: {rsi_long_threshold if signal_type=='LONG' else rsi_short_threshold})\n"
-                f"💸 **MFI (15m):** {mfi_15m:.1f}\n"
-                f"🏦 **OI:** {oi_formatted} ({oi_direction} %{abs(oi_change_pct):.2f})\n\n"
-                f"🧠 **Neden Girdik?**\n_{reason}_"
+                f"🌊 **Trend Gücü:** {adx_value:.1f} ({'Süper' if is_super_trend else 'Normal'})\n"
+                f"💵 **Giriş:** {current_price}\n"
+                f"🛑 **Stop (Swing):** {stop_loss:.4f}\n"
+                f"💰 **TP:** {take_profit:.4f}\n\n"
+                f"📊 **Analiz Verileri:**\n"
+                f"• RSI: {rsi_15m:.1f} (Limit: {rsi_long_limit if signal_type=='LONG' else rsi_short_limit})\n"
+                f"• MFI: {mfi_15m:.1f}\n"
+                f"• OI Değişim: {oi_direction} %{abs(oi_change_pct):.2f}\n"
+                f"• BTC Durumu: %{btc_market_data['change_24h']:.2f}\n\n"
+                f"🧠 **Mantık:**\n_{reason}_"
             )
             print(f"Sinyal gönderildi: {symbol}")
             send_telegram_message(msg)
@@ -217,17 +292,26 @@ def analyze_coin(symbol):
         return
     
 def run_sentinel():
-    print("🛡️ SENTINEL - TREND AVCISI MODU AKTİF")
-    send_telegram_message("📢 **SENTINEL DEVREDE**\nNöbet başladı. Trend yönlü fırsatlar taranıyor.")
+    print("🛡️ SENTINEL V7 - PRO TRADER MODU AKTİF")
+    send_telegram_message("📢 **SENTINEL PRO DEVREDE**\nUzman modüller yüklendi. (Dinamik RSI, Swing Stop, OI & BTC Kontrol)")
     
     try:
         while True:
             print(f"\n🔄 Tarama Başlıyor... {datetime.now().strftime('%H:%M:%S')}")
+            
+            # Global Market Verisi (Her döngüde bir kere)
+            btc_data = check_btc_trend()
+            if btc_data:
+                print(f"🌍 BTC Durumu: ${btc_data['price']} (%{btc_data['change_24h']:.2f})")
+            else:
+                 print("⚠️ BTC Verisi alınamadı, kör uçuş yapılıyor.")
+                 btc_data = {'change_24h': 0, 'price': 0, 'rsi': 50}
+
             coins = fetch_top_volume_coins(limit=None) 
             
             for symbol in coins:
                 print(f"🔎 {symbol}...", end="\r")
-                analyze_coin(symbol)
+                analyze_coin(symbol, btc_market_data=btc_data)
                 time.sleep(1) # API dostu bekleme
                 
             print("\n💤 Bekleme (60sn)...")
